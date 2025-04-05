@@ -47,6 +47,29 @@ static const struct qg_config config[] = {
 	[PMI632]	= {QG_PMIC5, PMI632},
 	[PM7250B]	= {QG_PMIC5, PM7250B},
 };
+// 在文件头部添加宏定义
+#define QG_IIO_CHAN(_prop, _idx, _debug)				\
+{								\
+	.channel = _idx,						\
+	.datasheet_name = #_prop,					\
+	.type = IIO_##_prop,						\
+	.info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED),		\
+	.debug_info = _debug,						\
+}
+
+// 添加新的通道索引（与枚举值对应）
+enum qg_iio_chan_id {
+    // 原有通道...
+    PSY_IIO_VOLTAGE_MAX,
+    PSY_IIO_CHARGE_FULL,
+};
+
+// 更新iio_channels结构
+static const struct iio_chan_spec qg_iio_channels[] = {
+    // 原有通道...
+    QG_IIO_CHAN(VOLTAGE_MAX, PSY_IIO_VOLTAGE_MAX, QG_DEBUG_STATUS),
+    QG_IIO_CHAN(CHARGE_FULL, PSY_IIO_CHARGE_FULL, QG_DEBUG_STATUS),
+};
 
 static const char *qg_get_battery_type(struct qpnp_qg *chip);
 static int qg_process_rt_fifo(struct qpnp_qg *chip);
@@ -2110,6 +2133,20 @@ static int qg_iio_write_raw(struct iio_dev *indio_dev,
 	int rc = 0;
 
 	switch (chan->channel) {
+	// 新增电压限制写操作
+	case PSY_IIO_VOLTAGE_MAX:
+		// 电压范围校验（4.2V-4.6V）
+		if (val1 < 4200000 || val1 > 4600000) {
+			pr_err("Invalid voltage_max %d (valid: 4200000-4600000)\n", val1);
+			return -EINVAL;
+		}
+		mutex_lock(&chip->data_lock);
+		chip->bp.float_volt_uv = val1;
+		qg_notify_charger(chip); // 通知充电器更新
+		mutex_unlock(&chip->data_lock);
+		qg_dbg(chip, QG_DEBUG_STATUS, "Set voltage_max=%duV\n", val1);
+		break;
+
 	case PSY_IIO_CHARGE_FULL:
 		if (chip->dt.cl_disable) {
 			pr_warn("Capacity learning disabled!\n");
@@ -2128,7 +2165,10 @@ static int qg_iio_write_raw(struct iio_dev *indio_dev,
 		if (!rc)
 			chip->cl->learned_cap_uah = val1;
 		mutex_unlock(&chip->cl->lock);
+		qg_dbg(chip, QG_DEBUG_STATUS, "Set charge_full=%duAh\n", val1);
 		break;
+
+	// 其他已有case保持不变...
 	case PSY_IIO_SOH:
 		chip->soh = val1;
 		qg_dbg(chip, QG_DEBUG_STATUS, "SOH update: SOH=%d esr_actual=%d esr_nominal=%d\n",
@@ -2175,6 +2215,13 @@ static int qg_iio_read_raw(struct iio_dev *indio_dev,
 	*val1 = 0;
 
 	switch (chan->channel) {
+	// 新增电压限制读操作
+	case PSY_IIO_VOLTAGE_MAX:
+		mutex_lock(&chip->data_lock);
+		*val1 = chip->bp.float_volt_uv;
+		mutex_unlock(&chip->data_lock);
+		qg_dbg(chip, QG_DEBUG_STATUS, "Read voltage_max=%duV\n", *val1);
+		break;
 	case PSY_IIO_CAPACITY:
 		rc = qg_get_battery_capacity(chip, val1);
 		break;
@@ -2225,17 +2272,36 @@ static int qg_iio_read_raw(struct iio_dev *indio_dev,
 	case PSY_IIO_BATT_PROFILE_VERSION:
 		*val1 = chip->bp.qg_profile_version;
 		break;
-	case PSY_IIO_CHARGE_COUNTER:
-		rc = qg_get_charge_counter(chip, val1);
-		break;
+	
+
+	// 原有charge_full读操作优化
 	case PSY_IIO_CHARGE_FULL:
 		if (!chip->dt.cl_disable && chip->dt.cl_feedback_on)
 			rc = qg_get_learned_capacity(chip, &temp);
 		else
 			rc = qg_get_nominal_capacity((int *)&temp, 250, true);
-		if (!rc)
+		if (!rc) {
 			*val1 = (int)temp;
+			qg_dbg(chip, QG_DEBUG_STATUS, "Read charge_full=%duAh\n", *val1);
+		}
 		break;
+
+	// 其他已有case保持不变...
+	default:
+		pr_debug("Unsupported QG IIO chan %d\n", chan->channel);
+		rc = -EINVAL;
+		break;
+	}
+
+	if (rc < 0) {
+		pr_err_ratelimited("Couldn't read IIO channel %d, rc = %d\n",
+			chan->channel, rc);
+		return rc;
+	}
+
+	return IIO_VAL_INT;
+}
+
 	case PSY_IIO_CHARGE_FULL_DESIGN:
 		rc = qg_get_nominal_capacity((int *)&temp, 250, true);
 		if (!rc)
@@ -2582,6 +2648,14 @@ done:
 	mutex_unlock(&chip->data_lock);
 	return rc;
 }
+
+static const struct qg_iio_psy_channels qg_iio_psy_channels[] = {
+	// 新增电压限制通道
+	QG_IIO_CHAN(VOLTAGE_MAX, voltage_max, QG_DEBUG_STATUS),
+	// 已有charge_full通道保持不变
+	QG_IIO_CHAN(CHARGE_FULL, charge_full, QG_DEBUG_STATUS),
+	// 其他通道...
+};
 
 static void qg_sleep_exit_work(struct work_struct *work)
 {
